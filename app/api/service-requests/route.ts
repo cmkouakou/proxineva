@@ -1,12 +1,11 @@
 // C:\src\proxineva\app\api\service-requests\route.ts
-
 import { NextResponse } from "next/server";
 import { createSupabaseAdmin } from "@/lib/supabase/admin";
 import { createSupabaseServer } from "@/lib/supabase/server";
 import { ServiceRequestSchema } from "@/lib/validators/serviceRequest";
-import { sendAdminNotification, sendClientConfirmation } from "@/lib/email/templates";
 
 const STATUS_ALLOWED = new Set(["NEW", "IN_PROGRESS", "DONE"]);
+const EVENT_TYPES = new Set(["NOTE", "STATUS_CHANGE", "SUMMARY_UPDATE"]);
 
 function isAllowedEmail(email: string | null | undefined) {
   const allowed = (process.env.ADMIN_EMAILS ?? "")
@@ -14,9 +13,7 @@ function isAllowedEmail(email: string | null | undefined) {
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
 
-  // si vide => pas de filtre
   if (allowed.length === 0) return true;
-
   return !!email && allowed.includes(email.toLowerCase());
 }
 
@@ -49,7 +46,6 @@ export async function POST(req: Request) {
 
     const supabase = createSupabaseAdmin();
 
-    // IMPORTANT: on récupère toutes les infos nécessaires aux emails
     const { data, error } = await supabase
       .from("service_requests")
       .insert({
@@ -62,36 +58,15 @@ export async function POST(req: Request) {
         phone: input.phone || null,
         description: input.description,
       })
-      .select("id, created_at, zone, category, mode, priority, full_name, email, phone, description")
+      .select("id, created_at")
       .single();
 
-    if (error) {
-      return NextResponse.json({ ok: false, error: error.message }, { status: 400 });
-    }
-
-    // Emails (non bloquants) : la demande doit être créée même si Resend échoue
-    try {
-      await sendAdminNotification(data as any);
-    } catch (e) {
-      console.error("sendAdminNotification failed:", e);
-    }
-
-    // Si tu veux garder la confirmation client désactivée, commente ce bloc
-    try {
-      await sendClientConfirmation(data as any);
-    } catch (e) {
-      console.error("sendClientConfirmation failed:", e);
-    }
-
+    if (error) return NextResponse.json({ ok: false, error: error.message }, { status: 400 });
     return NextResponse.json({ ok: true, request: data }, { status: 201 });
   } catch (err: any) {
     if (err?.name === "ZodError") {
-      return NextResponse.json(
-        { ok: false, error: "Validation error", issues: err.issues },
-        { status: 422 }
-      );
+      return NextResponse.json({ ok: false, error: "Validation error", issues: err.issues }, { status: 422 });
     }
-
     return NextResponse.json({ ok: false, error: err?.message ?? "Server error" }, { status: 500 });
   }
 }
@@ -114,9 +89,7 @@ export async function GET(req: Request) {
 
     let query = supabase
       .from("service_requests")
-      .select(
-        "id, created_at, zone, category, mode, priority, full_name, email, phone, description, status, internal_notes"
-      )
+      .select("id, created_at, zone, category, mode, priority, full_name, email, phone, description, status, internal_notes")
       .order("created_at", { ascending: false })
       .range(offset, offset + limit - 1);
 
@@ -124,37 +97,47 @@ export async function GET(req: Request) {
 
     const { data: rows, error } = await query;
 
-    if (error) {
-      return NextResponse.json({ ok: false, error: error.message }, { status: 400 });
-    }
-
+    if (error) return NextResponse.json({ ok: false, error: error.message }, { status: 400 });
     return NextResponse.json({ ok: true, count: rows?.length ?? 0, data: rows ?? [] }, { status: 200 });
   } catch (err: any) {
     return NextResponse.json({ ok: false, error: err?.message ?? "Server error" }, { status: 500 });
   }
 }
 
-// 🔒 ADMIN: mise à jour status / internal_notes
+// 🔒 ADMIN: mise à jour status / summary (internal_notes) / ajout note historique (add_note)
 export async function PATCH(req: Request) {
   try {
     const gate = await requireAdmin();
     if (!gate.ok) return gate.res;
 
+    const actorEmail = gate.user.email ?? "unknown";
+
     const body = await req.json();
-    const { id, status, internal_notes } = body ?? {};
+    const { id, status, internal_notes, add_note } = body ?? {};
 
     if (!id || typeof id !== "string") {
       return NextResponse.json({ ok: false, error: "Missing or invalid id" }, { status: 400 });
     }
 
+    const supabase = createSupabaseAdmin();
+
+    // 1) Lire l’état courant pour pouvoir logger from_status / comparaison summary
+    const { data: current, error: curErr } = await supabase
+      .from("service_requests")
+      .select("id, status, internal_notes")
+      .eq("id", id)
+      .single();
+
+    if (curErr || !current) {
+      return NextResponse.json({ ok: false, error: curErr?.message ?? "Request not found" }, { status: 404 });
+    }
+
+    // 2) Préparer update sur service_requests
     const update: Record<string, any> = {};
 
     if (status !== undefined) {
       if (typeof status !== "string" || !STATUS_ALLOWED.has(status)) {
-        return NextResponse.json(
-          { ok: false, error: "Invalid status. Use NEW | IN_PROGRESS | DONE" },
-          { status: 422 }
-        );
+        return NextResponse.json({ ok: false, error: "Invalid status. Use NEW | IN_PROGRESS | DONE" }, { status: 422 });
       }
       update.status = status;
     }
@@ -166,27 +149,75 @@ export async function PATCH(req: Request) {
       update.internal_notes = internal_notes;
     }
 
-    if (Object.keys(update).length === 0) {
-      return NextResponse.json(
-        { ok: false, error: "Nothing to update. Provide status and/or internal_notes." },
-        { status: 400 }
-      );
+    // Si on ne fait QUE add_note, pas besoin d’update la table service_requests
+    const willUpdateMain = Object.keys(update).length > 0;
+
+    let updatedRow: any = current;
+
+    if (willUpdateMain) {
+      const { data, error } = await supabase
+        .from("service_requests")
+        .update(update)
+        .eq("id", id)
+        .select("id, status, internal_notes, created_at")
+        .single();
+
+      if (error) return NextResponse.json({ ok: false, error: error.message }, { status: 400 });
+      updatedRow = data;
     }
 
-    const supabase = createSupabaseAdmin();
+    // 3) Logger les events (best effort: si log fail, on n’empêche pas le PATCH)
+    async function logEvent(payload: any) {
+      const t = payload?.event_type;
+      if (!t || typeof t !== "string" || !EVENT_TYPES.has(t)) return;
 
-    const { data, error } = await supabase
-      .from("service_requests")
-      .update(update)
-      .eq("id", id)
-      .select("id, status, internal_notes, created_at")
-      .single();
-
-    if (error) {
-      return NextResponse.json({ ok: false, error: error.message }, { status: 400 });
+      const { error } = await supabase.from("service_request_events").insert(payload);
+      if (error) {
+        console.warn("[service_request_events] log failed:", error.message);
+      }
     }
 
-    return NextResponse.json({ ok: true, request: data }, { status: 200 });
+    // A) add_note => NOTE (historique)
+    if (add_note !== undefined) {
+      if (typeof add_note !== "string" || add_note.trim().length === 0) {
+        return NextResponse.json({ ok: false, error: "add_note must be a non-empty string" }, { status: 422 });
+      }
+
+      await logEvent({
+        request_id: id,
+        actor_email: actorEmail,
+        event_type: "NOTE",
+        note: add_note.trim(),
+        from_status: null,
+        to_status: null,
+      });
+    }
+
+    // B) status change => STATUS_CHANGE
+    if (status !== undefined && status !== current.status) {
+      await logEvent({
+        request_id: id,
+        actor_email: actorEmail,
+        event_type: "STATUS_CHANGE",
+        note: null,
+        from_status: current.status,
+        to_status: status,
+      });
+    }
+
+    // C) summary change (internal_notes) => SUMMARY_UPDATE
+    if (internal_notes !== undefined && internal_notes !== (current.internal_notes ?? "")) {
+      await logEvent({
+        request_id: id,
+        actor_email: actorEmail,
+        event_type: "SUMMARY_UPDATE",
+        note: internal_notes,
+        from_status: null,
+        to_status: null,
+      });
+    }
+
+    return NextResponse.json({ ok: true, request: updatedRow }, { status: 200 });
   } catch (err: any) {
     return NextResponse.json({ ok: false, error: err?.message ?? "Server error" }, { status: 500 });
   }
