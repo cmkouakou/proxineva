@@ -1,5 +1,9 @@
 import { resend, NOTIFY_EMAIL, FROM_EMAIL } from "@/lib/email/resend";
 
+const SITE_URL =
+  (process.env.NEXT_PUBLIC_SITE_URL && process.env.NEXT_PUBLIC_SITE_URL.trim()) ||
+  "http://localhost:3000";
+
 type Req = {
   id: string;
   created_at: string;
@@ -18,8 +22,7 @@ export async function sendClientConfirmation(r: Req) {
     from: FROM_EMAIL,
     to: r.email,
     subject: "Proxineva — Demande reçue",
-    text:
-`Bonjour ${r.full_name},
+    text: `Bonjour ${r.full_name},
 
 Nous avons bien reçu ta demande (${r.zone}).
 Résumé:
@@ -42,8 +45,7 @@ export async function sendAdminNotification(r: Req) {
     from: FROM_EMAIL,
     to: NOTIFY_EMAIL,
     subject: `Nouvelle demande — ${r.zone} / ${r.category} / ${r.priority}`,
-    text:
-`Nouvelle demande:
+    text: `Nouvelle demande:
 - Nom: ${r.full_name}
 - Email: ${r.email}
 - Téléphone: ${r.phone ?? "-"}
@@ -56,6 +58,7 @@ Message:
 ${r.description}
 
 ID: ${r.id}
-Admin: /admin/requests/${r.id}`,
+Admin: ${SITE_URL}/admin/requests/${r.id}
+`,
   });
 }

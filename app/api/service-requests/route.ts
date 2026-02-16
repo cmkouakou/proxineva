@@ -1,8 +1,10 @@
 // C:\src\proxineva\app\api\service-requests\route.ts
+
 import { NextResponse } from "next/server";
 import { createSupabaseAdmin } from "@/lib/supabase/admin";
 import { createSupabaseServer } from "@/lib/supabase/server";
 import { ServiceRequestSchema } from "@/lib/validators/serviceRequest";
+import { sendAdminNotification, sendClientConfirmation } from "@/lib/email/templates";
 
 const STATUS_ALLOWED = new Set(["NEW", "IN_PROGRESS", "DONE"]);
 
@@ -24,10 +26,16 @@ async function requireAdmin() {
   const user = authData.user;
 
   if (!user) {
-    return { ok: false as const, res: NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 }) };
+    return {
+      ok: false as const,
+      res: NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 }),
+    };
   }
   if (!isAllowedEmail(user.email)) {
-    return { ok: false as const, res: NextResponse.json({ ok: false, error: "Forbidden" }, { status: 403 }) };
+    return {
+      ok: false as const,
+      res: NextResponse.json({ ok: false, error: "Forbidden" }, { status: 403 }),
+    };
   }
 
   return { ok: true as const, user };
@@ -41,6 +49,7 @@ export async function POST(req: Request) {
 
     const supabase = createSupabaseAdmin();
 
+    // IMPORTANT: on récupère toutes les infos nécessaires aux emails
     const { data, error } = await supabase
       .from("service_requests")
       .insert({
@@ -53,11 +62,25 @@ export async function POST(req: Request) {
         phone: input.phone || null,
         description: input.description,
       })
-      .select("id, created_at")
+      .select("id, created_at, zone, category, mode, priority, full_name, email, phone, description")
       .single();
 
     if (error) {
       return NextResponse.json({ ok: false, error: error.message }, { status: 400 });
+    }
+
+    // Emails (non bloquants) : la demande doit être créée même si Resend échoue
+    try {
+      await sendAdminNotification(data as any);
+    } catch (e) {
+      console.error("sendAdminNotification failed:", e);
+    }
+
+    // Si tu veux garder la confirmation client désactivée, commente ce bloc
+    try {
+      await sendClientConfirmation(data as any);
+    } catch (e) {
+      console.error("sendClientConfirmation failed:", e);
     }
 
     return NextResponse.json({ ok: true, request: data }, { status: 201 });

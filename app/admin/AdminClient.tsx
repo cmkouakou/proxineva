@@ -1,184 +1,263 @@
 // C:\src\proxineva\app\admin\AdminClient.tsx
 "use client";
 
-import { useMemo, useState } from "react";
-import type { ServiceRequest } from "./page";
+import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { createBrowserClient } from "@supabase/ssr";
+
+type ServiceRequest = {
+  id: string;
+  created_at: string;
+  zone: "CANADA" | "CIV";
+  category: string;
+  mode: "DOMICILE" | "EN_LIGNE";
+  priority: "EXPRESS" | "NORMAL";
+  full_name: string;
+  email: string;
+  phone: string | null;
+  description: string;
+  status: "NEW" | "IN_PROGRESS" | "DONE";
+  internal_notes: string | null;
+};
 
 const STATUS = ["NEW", "IN_PROGRESS", "DONE"] as const;
 
-type PatchBody = {
-  id: string;
-  status?: (typeof STATUS)[number];
-  internal_notes?: string | null;
-};
-
-function supabaseBrowser() {
-  return createBrowserClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-  );
+function formatAge(created_at: string) {
+  const ts = Date.parse(created_at);
+  if (Number.isNaN(ts)) return created_at;
+  const diff = Date.now() - ts;
+  const s = Math.floor(diff / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  const d = Math.floor(h / 24);
+  if (d > 0) return `${d} j`;
+  if (h > 0) return `${h} h`;
+  if (m > 0) return `${m} min`;
+  return `${s} s`;
 }
 
-export default function AdminClient({
-  initialRequests,
-}: {
-  initialRequests: ServiceRequest[];
-}) {
-  const [requests, setRequests] = useState<ServiceRequest[]>(initialRequests);
+export default function AdminClient() {
+  const [rows, setRows] = useState<ServiceRequest[]>([]);
+  const [loading, setLoading] = useState(false);
   const [loadingId, setLoadingId] = useState<string | null>(null);
-  const [noteDraft, setNoteDraft] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
 
-  const total = useMemo(() => requests.length, [requests.length]);
+  // draft des notes par demande
+  const [notesDraft, setNotesDraft] = useState<Record<string, string>>({});
 
-  async function logout() {
-    const supabase = supabaseBrowser();
-    await supabase.auth.signOut();
-    window.location.assign("/login");
+  const total = rows.length;
+
+  const supabase = useMemo(() => {
+    return createBrowserClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+    );
+  }, []);
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/service-requests?limit=200", { cache: "no-store" });
+      const json = await res.json().catch(() => null);
+
+      if (!res.ok || !json?.ok) {
+        throw new Error(json?.error ?? `Erreur HTTP ${res.status}`);
+      }
+
+      const data: ServiceRequest[] = json.data ?? [];
+      setRows(data);
+
+      // init drafts
+      const init: Record<string, string> = {};
+      for (const r of data) init[r.id] = r.internal_notes ?? "";
+      setNotesDraft(init);
+    } catch (e: any) {
+      setError(e?.message ?? "Erreur inconnue");
+      setRows([]);
+      setNotesDraft({});
+    } finally {
+      setLoading(false);
+    }
   }
 
-  async function refresh() {
-    // ⚠️ /api/service-requests est protégé, mais ici on est admin connecté → OK
-    const res = await fetch("/api/service-requests", { cache: "no-store" });
-    const json = await res.json();
-    setRequests(json.data ?? []);
-  }
+  useEffect(() => {
+    load();
+  }, []);
 
-  async function patchRequest(body: PatchBody) {
-    setLoadingId(body.id);
+  async function patch(id: string, body: any) {
+    setLoadingId(id);
     try {
       const res = await fetch("/api/service-requests", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ id, ...body }),
       });
 
-      const json = await res.json();
-
-      if (!res.ok) {
-        alert(json?.error ?? "Erreur PATCH");
-        return;
+      const json = await res.json().catch(() => null);
+      if (!res.ok || !json?.ok) {
+        throw new Error(json?.error ?? `Erreur HTTP ${res.status}`);
       }
 
-      await refresh();
+      // refresh local row (sans recharger toute la page)
+      setRows((prev) =>
+        prev.map((r) => {
+          if (r.id !== id) return r;
+          return {
+            ...r,
+            status: body.status ?? r.status,
+            internal_notes: body.internal_notes ?? r.internal_notes,
+          };
+        })
+      );
+    } catch (e: any) {
+      alert(`Échec mise à jour: ${e?.message ?? "Erreur inconnue"}`);
     } finally {
       setLoadingId(null);
     }
   }
 
-  return (
-    <div className="mt-6">
-      <div className="mb-3 flex items-center justify-between">
-        <div className="text-sm text-gray-600">Total: {total}</div>
+  async function logout() {
+    try {
+      await supabase.auth.signOut();
+      window.location.assign("/login");
+    } catch {
+      window.location.assign("/login");
+    }
+  }
 
-        <button onClick={logout} className="border rounded-md px-3 py-2 text-sm">
-          Se déconnecter
-        </button>
+  return (
+    <div style={{ padding: 24, maxWidth: 1100, margin: "0 auto" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "center" }}>
+        <div>
+          <h1 style={{ fontSize: 26, fontWeight: 800, margin: 0 }}>Admin — Demandes</h1>
+          <p style={{ marginTop: 8, opacity: 0.85 }}>
+            {loading ? "Chargement…" : error ? `Erreur: ${error}` : `Total: ${total}`}
+          </p>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <button
+            onClick={load}
+            style={{
+              padding: "10px 12px",
+              borderRadius: 10,
+              border: "1px solid #ccc",
+              cursor: "pointer",
+              background: "white",
+            }}
+          >
+            Rafraîchir
+          </button>
+
+          <button
+            onClick={logout}
+            style={{
+              padding: "10px 12px",
+              borderRadius: 10,
+              border: "1px solid #ccc",
+              cursor: "pointer",
+              background: "white",
+            }}
+          >
+            Se déconnecter
+          </button>
+        </div>
       </div>
 
-      <div className="space-y-3">
-        {requests.map((r) => {
-          const isLoading = loadingId === r.id;
+      <div style={{ marginTop: 18, display: "grid", gap: 14 }}>
+        {rows.map((r) => {
+          const age = formatAge(r.created_at);
+          const busy = loadingId === r.id;
 
           return (
-            <div key={r.id} className="rounded-xl border p-4">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-sm font-semibold">{r.status}</span>
-                <span className="text-sm text-gray-500">
-                  {new Date(r.created_at).toLocaleString()}
-                </span>
-                <span className="text-sm">• {r.zone}</span>
-                <span className="text-sm">• {r.category}</span>
-                <span className="text-sm">• {r.mode}</span>
-                <span className="text-sm">• {r.priority}</span>
+            <div
+              key={r.id}
+              style={{
+                border: "1px solid #ddd",
+                borderRadius: 14,
+                padding: 14,
+                background: "white",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                <div style={{ fontWeight: 800 }}>
+                  {r.status}{" "}
+                  <span style={{ fontWeight: 400, opacity: 0.8 }}>
+                    {age} · {r.zone} · {r.category} · {r.mode} · {r.priority}
+                  </span>
+                </div>
+
+                <Link href={`/admin/requests/${r.id}`} style={{ textDecoration: "underline" }}>
+                  Ouvrir →
+                </Link>
               </div>
 
-              <div className="mt-2 font-medium">
+              <div style={{ marginTop: 8, fontWeight: 700 }}>
                 {r.full_name} — {r.email}
               </div>
 
-              <p className="mt-2 text-gray-700">{r.description}</p>
+              <div style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{r.description}</div>
 
-              <div className="mt-3">
-                <label className="block text-xs text-gray-500 mb-1">
-                  Note interne (optionnel)
-                </label>
+              <div style={{ marginTop: 10, opacity: 0.75, fontSize: 12 }}>ID: {r.id}</div>
+
+              <div style={{ marginTop: 12 }}>
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>Note interne (optionnel)</div>
                 <textarea
-                  className="w-full rounded-lg border p-2 text-sm"
-                  rows={2}
-                  placeholder="Ex: Assigné à un agent, rappel client, etc."
-                  value={noteDraft[r.id] ?? r.internal_notes ?? ""}
-                  onChange={(e) =>
-                    setNoteDraft((prev) => ({ ...prev, [r.id]: e.target.value }))
-                  }
+                  value={notesDraft[r.id] ?? ""}
+                  onChange={(e) => setNotesDraft((prev) => ({ ...prev, [r.id]: e.target.value }))}
+                  rows={3}
+                  style={{
+                    width: "100%",
+                    padding: 10,
+                    borderRadius: 12,
+                    border: "1px solid #ddd",
+                  }}
+                  disabled={busy}
                 />
               </div>
 
-              <div className="mt-3 flex flex-wrap gap-2">
-                <button
-                  className="rounded-lg border px-3 py-1 text-sm"
-                  disabled={isLoading}
-                  onClick={() =>
-                    patchRequest({
-                      id: r.id,
-                      status: "NEW",
-                      internal_notes: noteDraft[r.id] ?? r.internal_notes ?? null,
-                    })
-                  }
-                >
-                  Mettre NEW
-                </button>
+              <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                {STATUS.map((s) => (
+                  <button
+                    key={s}
+                    disabled={busy}
+                    onClick={() => patch(r.id, { status: s })}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 10,
+                      border: "1px solid #ccc",
+                      cursor: busy ? "not-allowed" : "pointer",
+                      background: "white",
+                    }}
+                  >
+                    Mettre {s}
+                  </button>
+                ))}
 
                 <button
-                  className="rounded-lg border px-3 py-1 text-sm"
-                  disabled={isLoading}
-                  onClick={() =>
-                    patchRequest({
-                      id: r.id,
-                      status: "IN_PROGRESS",
-                      internal_notes: noteDraft[r.id] ?? r.internal_notes ?? null,
-                    })
-                  }
-                >
-                  Mettre IN_PROGRESS
-                </button>
-
-                <button
-                  className="rounded-lg border px-3 py-1 text-sm"
-                  disabled={isLoading}
-                  onClick={() =>
-                    patchRequest({
-                      id: r.id,
-                      status: "DONE",
-                      internal_notes: noteDraft[r.id] ?? r.internal_notes ?? null,
-                    })
-                  }
-                >
-                  Mettre DONE
-                </button>
-
-                <button
-                  className="rounded-lg border px-3 py-1 text-sm"
-                  disabled={isLoading}
-                  onClick={() =>
-                    patchRequest({
-                      id: r.id,
-                      internal_notes: noteDraft[r.id] ?? "",
-                    })
-                  }
+                  disabled={busy}
+                  onClick={() => patch(r.id, { internal_notes: notesDraft[r.id] ?? "" })}
+                  style={{
+                    padding: "10px 12px",
+                    borderRadius: 10,
+                    border: "1px solid #ccc",
+                    cursor: busy ? "not-allowed" : "pointer",
+                    background: "white",
+                  }}
                 >
                   Sauver note seulement
                 </button>
-
-                {isLoading && (
-                  <span className="text-sm text-gray-500">Mise à jour…</span>
-                )}
               </div>
-
-              <div className="mt-2 text-xs text-gray-400">ID: {r.id}</div>
             </div>
           );
         })}
+
+        {!loading && !error && rows.length === 0 && (
+          <div style={{ padding: 18, border: "1px dashed #ccc", borderRadius: 14 }}>
+            Aucune demande.
+          </div>
+        )}
       </div>
     </div>
   );
